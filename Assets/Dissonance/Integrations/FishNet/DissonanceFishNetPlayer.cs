@@ -54,18 +54,18 @@ namespace Dissonance.Integrations.FishNet
             }
         }
 
-        public void OnDestroy()
+        private void OnDestroy()
         {
             if (_comms != null)
                 _comms.Comms.LocalPlayerNameChanged -= SetPlayerName;
         }
 
-        public void OnEnable()
+        private void OnEnable()
         {
             _comms = DissonanceFishNetComms.Instance;
         }
 
-        public void OnDisable()
+        private void OnDisable()
         {
             if (IsTracking)
                 StopTracking();
