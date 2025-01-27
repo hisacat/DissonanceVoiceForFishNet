@@ -14,6 +14,9 @@ namespace Dissonance.Integrations.FishNet
     public class DissonanceFishNetPlayer
         : NetworkBehaviour, IDissonancePlayer
     {
+        [Tooltip("This transform will be used in positional voice processing. If unset, then GameObject's transform will be used.")]
+        [SerializeField] private Transform trackingTransform;
+
         private static readonly Log Log = Logs.Create(LogCategory.Network, "FishNet Player Component");
 
         private DissonanceFishNetComms _comms;
@@ -33,12 +36,12 @@ namespace Dissonance.Integrations.FishNet
 
         public Vector3 Position
         {
-            get { return transform.position; }
+            get { return trackingTransform != null ? trackingTransform.position : transform.position; }
         }
 
         public Quaternion Rotation
         {
-            get { return transform.rotation; }
+            get { return trackingTransform != null ? trackingTransform.rotation : transform.rotation; }
         }
 
         public NetworkPlayerType Type
