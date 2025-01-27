@@ -1,112 +1,182 @@
-using System;
-using Dissonance.Integrations.FishNet.Utils;
-using FishNet.Connection;
+using UnityEngine;
 using FishNet.Object;
 using FishNet.Object.Synchronizing;
-using UnityEngine;
+using FishNet.Connection;
+using Dissonance.Integrations.FishNet.Utils;
 
 namespace Dissonance.Integrations.FishNet
 {
-    // A Player object wrapper for Dissonance Voice
-    public sealed class DissonanceFishNetPlayer : NetworkBehaviour, IDissonancePlayer
+    /// <summary>
+    /// When added to the player prefab, allows Dissonance to automatically track
+    /// the location of remote players for positional audio for games using the
+    /// FishNet API.
+    /// </summary>
+    public class DissonanceFishNetPlayer
+        : NetworkBehaviour, IDissonancePlayer
     {
-        [Tooltip("This transform will be used in positional voice processing. If unset, then GameObject's transform will be used.")]
-        [SerializeField] private Transform trackingTransform;
-        
-        // SyncVar ensures that all observers know player ID, even late joiners
-        private readonly SyncVar<string> _syncedPlayerName = new (settings: new SyncTypeSettings(WritePermission.ServerOnly, ReadPermission.Observers));
+        private static readonly Log Log = Logs.Create(LogCategory.Network, "FishNet Player Component");
 
-        // Captured DissonanceComms instance
-        public DissonanceComms Comms { get; private set; }
-        
-        
-        public string PlayerId => _syncedPlayerName.Value;
-        public Vector3 Position => trackingTransform.position;
-        public Quaternion Rotation => trackingTransform.rotation;
-        public NetworkPlayerType Type => IsOwner ? NetworkPlayerType.Local : NetworkPlayerType.Remote;
+        private DissonanceFishNetComms _comms;
 
         public bool IsTracking { get; private set; }
 
+        /// <summary>
+        /// The name of the player
+        /// </summary>
+        /// <remarks>
+        /// This is a syncvar, this means unity will handle setting this value.
+        /// This is important for Join-In-Progress because new clients will join and instantly have the player name correctly set without any effort on our part.
+        /// https://fish-networking.gitbook.io/docs/manual/guides/synchronizing/syncvar
+        /// </remarks>
+        private readonly SyncVar<string> _playerId = new(settings: new SyncTypeSettings(WritePermission.ClientUnsynchronized, ReadPermission.Observers));
+        public string PlayerId { get { return _playerId.Value; } }
 
-        private void Awake()
+        public Vector3 Position
         {
-            if (trackingTransform == null) trackingTransform = transform;
+            get { return transform.position; }
         }
 
-        private void OnEnable()
+        public Quaternion Rotation
         {
-            ManageTrackingState(true);
-        }
-        
-        private void OnDisable()
-        { 
-            ManageTrackingState(false);
+            get { return transform.rotation; }
         }
 
-        // Called by FishNet when object is spawned on client with authority
+        public NetworkPlayerType Type
+        {
+            get
+            {
+                if (_comms == null || _playerId.Value == null)
+                    return NetworkPlayerType.Unknown;
+                return _comms.Comms.LocalPlayerName.Equals(_playerId.Value) ? NetworkPlayerType.Local : NetworkPlayerType.Remote;
+            }
+        }
+
+        public void OnDestroy()
+        {
+            if (_comms != null)
+                _comms.Comms.LocalPlayerNameChanged -= SetPlayerName;
+        }
+
+        public void OnEnable()
+        {
+            _comms = DissonanceFishNetComms.Instance;
+        }
+
+        public void OnDisable()
+        {
+            if (IsTracking)
+                StopTracking();
+        }
+
+        public override void OnStartNetwork()
+        {
+            base.OnStartNetwork();
+
+            _playerId.OnChange += OnPlayerIdChanged;
+        }
+
+        public override void OnStopNetwork()
+        {
+            base.OnStopNetwork();
+
+            _playerId.OnChange -= OnPlayerIdChanged;
+        }
+
         public override void OnOwnershipClient(NetworkConnection prevOwner)
         {
             base.OnOwnershipClient(prevOwner);
 
-            if (prevOwner == null || !IsOwner) return;
-            
-            DissonanceFishNetComms fishNetComms = DissonanceFishNetComms.Instance;
-            if (fishNetComms == null)
+            if (this.IsOwner == false) return;
+
+            var comms = DissonanceFishNetComms.Instance;
+            if (comms == null)
             {
-                LoggingHelper.Logger.Error("Could not find any DissonanceFishNetComms instance! This DissonancePlayer instance will not work!");
-                return;
+                LoggingHelper.Logger.Error(
+                    "cannot find DissonanceFishNetComms component in scene\r\n" +
+                    "not placing a DissonanceFishNetComms component on a game object in the scene");
             }
 
-            // Configure Player name
-            fishNetComms.Comms.LocalPlayerNameChanged += SetPlayerName;
-            if (fishNetComms.Comms.LocalPlayerName == null)
-            {
-                string randomGuid = Guid.NewGuid().ToString();
-                fishNetComms.Comms.LocalPlayerName = randomGuid;
-            }
-            else
-            {
-                SetPlayerName(fishNetComms.Comms.LocalPlayerName);
-            }
+            Log.Debug("Tracking `OnStartLocalPlayer` Name={0}", comms.Comms.LocalPlayerName);
+
+            // This method is called on the client which has control authority over this object. This will be the local client of whichever player we are tracking.
+            if (comms.Comms.LocalPlayerName != null)
+                SetPlayerName(comms.Comms.LocalPlayerName);
+
+            //Subscribe to future name changes (this is critical because we may not have run the initial set name yet and this will trigger that initial call)
+            comms.Comms.LocalPlayerNameChanged += SetPlayerName;
         }
 
         private void SetPlayerName(string playerName)
         {
-            // Disable tracking before name change
-            if (IsTracking) ManageTrackingState(false);
-            
-            // Update name & re-enable tracking
-            _syncedPlayerName.Value = playerName;
-            ManageTrackingState(true);
-            
-            // And if owner, sync name over network
-            if(IsOwner) ServerRpcSetPlayerName(playerName);
-        }
-        
-        [ServerRpc(RequireOwnership = true)]
-        private void ServerRpcSetPlayerName(string playerName)
-        {
-            _syncedPlayerName.Value = playerName;
-        }
+            //We need the player name to be set on all the clients and then tracking to be started (on each client).
+            //To do this we send a command from this client, informing the server of our name. The server will pass this on to all the clients (with an RPC)
+            // Client -> Server -> Client
 
-        private void OnSyncedPlayerNameUpdated(string _, string updatedName, bool __)
-        {
-            if(!IsOwner) SetPlayerName(updatedName);
+            //We need to stop and restart tracking to handle the name change
+            if (IsTracking)
+                StopTracking();
+
+            //Perform the actual work
+            _playerId.Value = playerName;
+            StartTracking();
+
+            //Inform the server the name has changed
+            if (IsOwner)
+                RpcSetPlayerName(playerName);
         }
 
-        private void ManageTrackingState(bool track)
+        public override void OnStartClient()
         {
-            // Check if you should change tracking state
-            if (IsTracking == track) return;
-            if (DissonanceFishNetComms.Instance == null) return;
-            if (track && !DissonanceFishNetComms.Instance.IsInitialized) return;
+            base.OnStartClient();
 
-            // And update it
-            DissonanceComms comms = DissonanceFishNetComms.Instance.Comms;
-            if (track) comms.TrackPlayerPosition(this);
-            else comms.StopTracking(this);
+            //A client is starting. Start tracking if the name has been properly initialised
+            if (!string.IsNullOrEmpty(PlayerId))
+                StartTracking();
+        }
 
-            IsTracking = track;
+        /// <summary>
+        /// Invoking on client will cause it to run on the server
+        /// </summary>
+        /// <param name="playerName"></param>
+        [ServerRpc]
+        private void RpcSetPlayerName(string playerName)
+        {
+            // The server changes the value of _playerId, and since it is of the SyncVar type, the OnPlayerIdChanged callback will be triggered on all clients
+            _playerId.Value = playerName;
+        }
+
+        /// <summary>
+        /// When the server changes the value of _playerId, it is run on all clients
+        /// </summary>
+        /// <param name="playerName"></param>
+        private void OnPlayerIdChanged(string prev, string next, bool asServer)
+        {
+            if (!IsOwner)
+                SetPlayerName(next);
+        }
+
+        private void StartTracking()
+        {
+            if (IsTracking)
+                throw Log.CreatePossibleBugException("Attempting to start player tracking, but tracking is already started", "31971B1F-52FD-4FCF-89E9-67A17A917921");
+
+            if (_comms != null)
+            {
+                _comms.Comms.TrackPlayerPosition(this);
+                IsTracking = true;
+            }
+        }
+
+        private void StopTracking()
+        {
+            if (!IsTracking)
+                throw Log.CreatePossibleBugException("Attempting to stop player tracking, but tracking is not started", "C7CF0174-0667-4F07-88E3-800ED652142D");
+
+            if (_comms != null)
+            {
+                _comms.Comms.StopTracking(this);
+                IsTracking = false;
+            }
         }
     }
 }
