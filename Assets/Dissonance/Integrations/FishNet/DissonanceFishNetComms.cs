@@ -58,10 +58,14 @@ namespace Dissonance.Integrations.FishNet
         protected override void OnDisable()
         {
             ManageNetworkEvents(false);
+
+            base.OnDisable();
         }
 
         protected override void Initialize()
         {
+            base.Initialize();
+
             // Register no broadcast handler so errors can be captured easier
             NetworkManager.ServerManager.RegisterBroadcast<DissonanceFishNetBroadcast>(NullBroadcastReceivedHandler);
             NetworkManager.ClientManager.RegisterBroadcast<DissonanceFishNetBroadcast>(NullBroadcastReceivedHandler);
